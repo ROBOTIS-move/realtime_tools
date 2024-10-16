@@ -45,11 +45,39 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <deque>
+#include <sstream>
+#include <iostream>
 
 #include "rclcpp/publisher.hpp"
 
 namespace realtime_tools
 {
+
+class TraceBackLog {
+public:
+  void addline(std::string line) {
+    std::lock_guard<std::mutex> lock(mu_);
+    traceback_.push_back(line);
+    if (traceback_.size() > max_lines) {
+      traceback_.pop_front();
+    }
+  }
+
+  std::string get_trace_back() {
+    std::lock_guard<std::mutex> lock(mu_);
+    std::ostringstream out;
+    for (const auto & line : traceback_) {
+      out << line << std::endl;
+    }
+    return out.str();
+  }
+
+private:
+  std::deque<std::string> traceback_;
+  const size_t max_lines = 20;
+  std::mutex mu_;
+};
 
 template<class Msg>
 class RealtimePublisher
@@ -103,8 +131,18 @@ public:
    */
   bool trylock()
   {
+    static int lock_fail_count = 0;
+    if (lock_fail_count > 1000) {
+      std::cout << "*** [ERROR] trylock() failed to get lock for 1000 iterations ***" << std::endl;
+      std::cout << "*** [DEBUG] thread trace back for realtime publisher: ***" << std::endl;
+      std::cout << tb_.get_trace_back() << std::endl;
+      std::cout << "*** [DEBUG] end of thread trace back ***" << std::endl;
+      lock_fail_count = 0;
+    }
     if (msg_mutex_.try_lock()) {
       if (turn_ == REALTIME) {
+        tb_.addline("[main thread] trylock()");
+        lock_fail_count = 0;
         return true;
       } else {
         msg_mutex_.unlock();
@@ -124,6 +162,7 @@ public:
   void unlockAndPublish()
   {
     turn_ = NON_REALTIME;
+    tb_.addline("[main thread] unlock from unlockAndPublish()");
     msg_mutex_.unlock();
 #ifdef NON_POLLING
     updated_cond_.notify_one();
@@ -170,13 +209,16 @@ private:
 
       // Locks msg_ and copies it
       lock();
+      tb_.addline("[publishing thread] lock from start of run loop");
       while (turn_ != NON_REALTIME && keep_running_) {
 #ifdef NON_POLLING
         updated_cond_.wait(lock);
 #else
+        tb_.addline("[publishing thread] unlock to sleep.");
         unlock();
         std::this_thread::sleep_for(std::chrono::microseconds(500));
         lock();
+        tb_.addline("[publishing thread] done sleep. lock again.");
 #endif
       }
       outgoing = msg_;
@@ -186,6 +228,7 @@ private:
 
       // Sends the outgoing message
       if (keep_running_) {publisher_->publish(outgoing);}
+      tb_.addline("Published message");
     }
     is_running_ = false;
   }
@@ -204,6 +247,7 @@ private:
 
   enum { REALTIME, NON_REALTIME, LOOP_NOT_STARTED };
   std::atomic<int> turn_;  // Who's turn is it to use msg_?
+  TraceBackLog tb_;
 };
 
 template<class Msg>
